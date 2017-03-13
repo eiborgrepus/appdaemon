@@ -8,7 +8,6 @@ import traceback
 import configparser
 import datetime
 from time import mktime
-import argparse
 import time
 import logging
 import os
@@ -32,6 +31,8 @@ import appdaemon.appapi as api
 import platform
 import math
 import random
+from appdaemon.config.cmdline import CmdLineParser
+from appdaemon.config.logging import setup_logging
 
 __version__ = "1.5.2"
 
@@ -42,7 +43,6 @@ if platform.system() != "Windows":
 
 q = Queue(maxsize=0)
 
-config = None
 config_file_modified = 0
 config_file = ""
 was_dst = None
@@ -328,10 +328,10 @@ def dispatch_worker(name, args):
     #
     # Argument Constraints
     #
-    for arg in config[name].keys():
-        if not check_constraint(arg, config[name][arg]):
+    for arg in conf.config[name].keys():
+        if not check_constraint(arg, conf.config[name][arg]):
             unconstrained = False
-    if not check_time_constraint(config[name], name):
+    if not check_time_constraint(conf.config[name], name):
         unconstrained = False
     #
     # Callback level constraints
@@ -635,16 +635,14 @@ def worker():
 
 
 def term_file(name):
-    global config
-    for key in config:
-        if "module" in config[key] and config[key]["module"] == name:
+    for key in conf.config:
+        if "module" in conf.config[key] and conf.config[key]["module"] == name:
             term_object(key)
 
 
 def clear_file(name):
-    global config
-    for key in config:
-        if "module" in config[key] and config[key]["module"] == name:
+    for key in conf.config:
+        if "module" in conf.config[key] and conf.config[key]["module"] == name:
             clear_object(key)
             if key in conf.objects:
                 del conf.objects[key]
@@ -883,23 +881,23 @@ def process_message(data):
 
 def check_config():
     global config_file_modified
-    global config
+
+    filename = conf.app_daemon_config.config_file
 
     try:
-        modified = os.path.getmtime(config_file)
+        modified = os.path.getmtime(filename)
         if modified > config_file_modified:
-            ha.log(conf.logger, "INFO", "{} modified".format(config_file))
+            ha.log(conf.logger, "INFO", "{} modified".format(filename))
             config_file_modified = modified
             new_config = configparser.ConfigParser()
-            new_config.read_file(open(config_file))
+            new_config.read(filename)
 
             # Check for changes
-
-            for name in config:
+            for name in conf.config:
                 if name == "DEFAULT" or name == "AppDaemon":
                     continue
                 if name in new_config:
-                    if config[name] != new_config[name]:
+                    if conf.config[name] != new_config[name]:
                         # Something changed, clear and reload
 
                         ha.log(
@@ -925,7 +923,7 @@ def check_config():
             for name in new_config:
                 if name == "DEFAULT" or name == "AppDaemon":
                     continue
-                if name not in config:
+                if name not in conf.config:
                     #
                     # New section added!
                     #
@@ -938,7 +936,7 @@ def check_config():
                         new_config[name]["module"], new_config[name]
                     )
 
-            config = new_config
+            conf.config = new_config
     except:
         ha.log(conf.error, "WARNING", '-' * 60)
         ha.log(conf.error, "WARNING", "Unexpected error:")
@@ -953,7 +951,6 @@ def check_config():
 
 
 def read_app(file, reload=False):
-    global config
     name = os.path.basename(file)
     module_name = os.path.splitext(name)[0]
     # Import the App
@@ -987,13 +984,13 @@ def read_app(file, reload=False):
 
         # Instantiate class and Run initialize() function
 
-        for name in config:
+        for name in conf.config:
             if name == "DEFAULT" or name == "AppDaemon":
                 continue
-            if module_name == config[name]["module"]:
-                class_name = config[name]["class"]
+            if module_name == conf.config[name]["module"]:
+                class_name = conf.config[name]["class"]
 
-                init_object(name, class_name, module_name, config[name])
+                init_object(name, class_name, module_name, conf.config[name])
 
     except:
         ha.log(conf.error, "WARNING", '-' * 60)
@@ -1010,12 +1007,12 @@ def read_app(file, reload=False):
 
 
 def get_module_dependencies(file):
-    global config
     module_name = get_module_from_path(file)
-    for key in config:
-        if "module" in config[key] and config[key]["module"] == module_name:
-            if "dependencies" in config[key]:
-                return config[key]["dependencies"].split(",")
+    for key in conf.config:
+        if "module" in conf.config[key] \
+                and conf.config[key]["module"] == module_name:
+            if "dependencies" in conf.config[key]:
+                return conf.config[key]["dependencies"].split(",")
             else:
                 return None
 
@@ -1057,14 +1054,13 @@ def get_module_from_path(path):
 
 
 def find_dependent_modules(module):
-    global config
     module_name = get_module_from_path(module["name"])
     dependents = []
-    for mod in config:
-        if "dependencies" in config[mod]:
-            for dep in config[mod]["dependencies"].split(","):
+    for mod in conf.config:
+        if "dependencies" in conf.config[mod]:
+            for dep in conf.config[mod]["dependencies"].split(","):
                 if dep == module_name:
-                    dependents.append(config[mod]["module"])
+                    dependents.append(conf.config[mod]["module"])
     return dependents
 
 
@@ -1085,7 +1081,6 @@ def file_in_modules(file, modules):
 
 
 def read_apps(all_=False):
-    global config
     found_files = []
     modules = []
     for root, subdirs, files in os.walk(conf.app_dir):
@@ -1433,18 +1428,22 @@ def run():
 
 
 def find_path(name):
-    for path in [os.path.join(os.path.expanduser("~"), ".homeassistant"),
-                 os.path.join(os.path.sep, "etc", "appdaemon")]:
-        _file = os.path.join(path, name)
-        if os.path.isfile(_file) or os.path.isdir(_file):
-            return _file
+    if conf.config_dir is None:
+        raise ValueError(
+            ("Not looking up {}. " +
+             "No config dir specified and default locations aren't present.")
+            .format(name))
+
+    _file = os.path.join(conf.config_dir, name)
+    if os.path.isfile(_file) or os.path.isdir(_file):
+        return _file
+
     raise ValueError(
-        "{} not specified and not found in default locations".format(name)
+        "Cannot find {} in {}.".format(name, conf.config_dir)
     )
 
 
 def main():
-    global config
     global config_file
     global config_file_modified
 
@@ -1458,63 +1457,13 @@ def main():
         signal.signal(signal.SIGHUP, handle_sig)
 
     # Get command line args
+    command_line = CmdLineParser(__version__)
+    conf.configure(command_line)
 
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "-c", "--config", help="full path to config file",
-        type=str, default=None
-    )
-    parser.add_argument(
-        "-p", "--pidfile", help="full path to PID File",
-        default="/tmp/hapush.pid"
-    )
-    parser.add_argument(
-        "-t", "--tick",
-        help="time in seconds that a tick in the schedular lasts",
-        default=1, type=float
-    )
-    parser.add_argument(
-        "-s", "--starttime",
-        help="start time for scheduler <YYYY-MM-DD HH:MM:SS>",
-        type=str
-    )
-    parser.add_argument(
-        "-e", "--endtime",
-        help="end time for scheduler <YYYY-MM-DD HH:MM:SS>",
-        type=str, default=None
-    )
-    parser.add_argument(
-        "-i", "--interval",
-        help="multiplier for scheduler tick", type=float,
-        default=1
-    )
-    parser.add_argument(
-        "-D", "--debug", help="debug level", default="INFO",
-        choices=[
-            "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"
-        ]
-    )
-    parser.add_argument(
-        '-v', '--version', action='version',
-        version='%(prog)s ' + __version__
-    )
-    parser.add_argument(
-        '--commtype', help="Communication Library to use",
-        default="WEBSOCKETS", choices=["SSE", "WEBSOCKETS"]
-    )
-
-    # Windows does not have Daemonize package so disallow
-    if platform.system() != "Windows":
-        parser.add_argument("-d", "--daemon",
-                            help="run as a background process",
-                            action="store_true")
-
-    args = parser.parse_args()
+    args = command_line.parse_args()
 
     conf.tick = args.tick
     conf.interval = args.interval
-    conf.loglevel = args.debug
 
     if args.starttime is not None:
         conf.now = datetime.datetime.strptime(
@@ -1531,89 +1480,10 @@ def main():
     if conf.tick != 1 or conf.interval != 1 or args.starttime is not None:
         conf.realtime = False
 
-    config_file = args.config
-
     conf.commtype = args.commtype
 
-    if config_file is None:
-        config_file = find_path("appdaemon.cfg")
-
-    if platform.system() != "Windows":
-        isdaemon = args.daemon
-    else:
-        isdaemon = False
-
-    # Read Config File
-
-    config = configparser.ConfigParser()
-    config.read_file(open(config_file))
-
-    assert "AppDaemon" in config, "[AppDaemon] section required in {}".format(
-        config_file
-    )
-
-    conf.config = config
-    conf.ha_url = config['AppDaemon']['ha_url']
-    conf.ha_key = config['AppDaemon'].get('ha_key', "")
-    conf.logfile = config['AppDaemon'].get("logfile")
-    conf.errorfile = config['AppDaemon'].get("errorfile")
-    conf.app_dir = config['AppDaemon'].get("app_dir")
-    conf.threads = int(config['AppDaemon']['threads'])
-    conf.certpath = config['AppDaemon'].get("cert_path")
-
-    if conf.logfile is None:
-        conf.logfile = "STDOUT"
-
-    if conf.errorfile is None:
-        conf.errorfile = "STDERR"
-
-    if isdaemon and (
-            conf.logfile == "STDOUT" or conf.errorfile == "STDERR"
-            or conf.logfile == "STDERR" or conf.errorfile == "STDOUT"
-    ):
-        raise ValueError("STDOUT and STDERR not allowed with -d")
-
-    # Setup Logging
-
-    conf.logger = logging.getLogger("log1")
-    numeric_level = getattr(logging, args.debug, None)
-    conf.logger.setLevel(numeric_level)
-    conf.logger.propagate = False
-    # formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
-
-    # Send to file if we are daemonizing, else send to console
-
-    if conf.logfile != "STDOUT":
-        fh = RotatingFileHandler(conf.logfile, maxBytes=1000000, backupCount=3)
-        fh.setLevel(numeric_level)
-        # fh.setFormatter(formatter)
-        conf.logger.addHandler(fh)
-    else:
-        # Default for StreamHandler() is sys.stderr
-        ch = logging.StreamHandler(stream=sys.stdout)
-        ch.setLevel(numeric_level)
-        # ch.setFormatter(formatter)
-        conf.logger.addHandler(ch)
-
-    # Setup compile output
-
-    conf.error = logging.getLogger("log2")
-    numeric_level = getattr(logging, args.debug, None)
-    conf.error.setLevel(numeric_level)
-    conf.error.propagate = False
-    # formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
-
-    if conf.errorfile != "STDERR":
-        efh = RotatingFileHandler(
-            conf.errorfile, maxBytes=1000000, backupCount=3
-        )
-    else:
-        efh = logging.StreamHandler()
-
-    efh.setLevel(numeric_level)
-    # efh.setFormatter(formatter)
-    conf.error.addHandler(efh)
-
+    keep_fds = setup_logging(conf)
+    conf.app_daemon_config.log_deprecated_entries(ha.log)
     # Startup message
 
     ha.log(
@@ -1652,43 +1522,15 @@ def main():
 
     if "elevation" in ha_config:
         conf.elevation = ha_config["elevation"]
-        if "elevation" in config['AppDaemon']:
-            ha.log(conf.logger, "WARNING",
-                   "'elevation' directive is deprecated, please remove")
     else:
-        conf.elevation = config['AppDaemon']["elevation"]
+        conf.elevation = conf.config['AppDaemon']["elevation"]
 
     # Use the supplied timezone
     os.environ['TZ'] = conf.time_zone
 
-    # Now we have logging, warn about deprecated directives
-    if "latitude" in config['AppDaemon']:
-        ha.log(
-            conf.logger, "WARNING",
-            "'latitude' directive is deprecated, please remove"
-        )
-
-    if "longitude" in config['AppDaemon']:
-        ha.log(
-            conf.logger, "WARNING",
-            "'longitude' directive is deprecated, please remove"
-        )
-
-    if "timezone" in config['AppDaemon']:
-        ha.log(
-            conf.logger, "WARNING",
-            "'timezone' directive is deprecated, please remove"
-        )
-
-    if "time_zone" in config['AppDaemon']:
-        ha.log(
-            conf.logger, "WARNING",
-            "'time_zone' directive is deprecated, please remove"
-        )
-
     init_sun()
 
-    config_file_modified = os.path.getmtime(config_file)
+    config_file_modified = os.path.getmtime(conf.app_daemon_config.config_file)
 
     # Add appdir  and subdirs to path
     if conf.app_dir is None:
@@ -1700,8 +1542,7 @@ def main():
 
     # Start main loop
 
-    if isdaemon:
-        keep_fds = [fh.stream.fileno(), efh.stream.fileno()]
+    if command_line.daemon:
         pid = args.pidfile
         daemon = Daemonize(app="appdaemon", pid=pid, action=run,
                            keep_fds=keep_fds)
